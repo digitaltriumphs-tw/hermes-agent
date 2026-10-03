@@ -28,6 +28,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from gateway.kanban_watchers_common import _acquire_singleton_lock, _release_singleton_lock, dispatcher_lock_path
 from hermes_cli import kanban_db
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
@@ -1256,13 +1257,25 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 @router.post("/dispatch")
 def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
-    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
-    with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
-        try:
-            return asdict(result)  # DispatchResult is a dataclass
-        except TypeError:
-            return {"result": str(result)}
+    """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick.
+
+    A tick (dry-run or not) runs only while no other process owns the machine-wide dispatcher lock: this
+    process would otherwise be a second dispatcher claiming under its own ``host:pid`` and sweeping
+    the owner's workers with its own liveness view. ``dry_run`` is not exempt: ``dispatch_once`` still
+    reclaims, promotes and times out tasks in that mode (it only skips spawning).
+    """
+    owner, state = _acquire_singleton_lock(dispatcher_lock_path())
+    if state == "contended":
+        return {"spawned": [], "skipped_dispatcher_owned": True}
+    try:
+        with _board_conn(board) as (board, conn):
+            result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
+            try:
+                return asdict(result)  # DispatchResult is a dataclass
+            except TypeError:
+                return {"result": str(result)}
+    finally:
+        _release_singleton_lock(owner)
 
 
 @router.get("/model-options")

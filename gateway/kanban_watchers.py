@@ -19,6 +19,7 @@ from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
     _release_singleton_lock,
+    dispatcher_lock_path,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
     _to_thread_process_service,
@@ -240,7 +241,7 @@ class GatewayKanbanWatchersMixin:
         # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
         # lives at the machine-global kanban root, so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        _lock_path = dispatcher_lock_path()
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
             logger.info("kanban dispatcher: another gateway already holds the dispatcher "

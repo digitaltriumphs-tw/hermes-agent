@@ -110,6 +110,13 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def dispatcher_lock_path() -> Path:
+    """Machine-wide singleton-dispatcher lock file: the one owner of "who may dispatch"."""
+    from hermes_cli import kanban_db as _kb
+
+    return _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take the exclusive, non-blocking advisory lock for the sole dispatcher.
 
