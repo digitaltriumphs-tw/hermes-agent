@@ -15619,29 +15619,30 @@ async function connectDesktopProfileRoute(
   const scopeKey = backendScopeKey(route.connectionId, route.profile)
   const clearSpawnPriority = applySpawnPriority(scopeKey, spawnPriority)
 
+  const dial = () =>
+    route.connectionId
+      ? ensureRegistryBackend(route.connectionId, route.profile, '', { spawnPriority })
+      : ensureBackend(route.profile, { spawnPriority })
+
   let connection
 
   try {
-    connection = await backendDialClaims.run(scopeKey, () =>
-      route.connectionId
-        ? ensureRegistryBackend(route.connectionId, route.profile, '', { spawnPriority })
-        : ensureBackend(route.profile, { spawnPriority })
-    )
-  } catch (error) {
-    // Losing a start race is not a boot failure: while the supervisor respawn
-    // is still resolving, a newer attempt (ours included) owns the slot and
-    // its result is the answer the renderer wants. Fail with this error only
-    // when no newer attempt ever publishes.
-    if (isSupersededStartError(error)) {
-      const current = backendConnectionState.getPendingPromise() ?? backendConnectionState.getPromise()
-
-      if (current) {
-        connection = await current
-      } else {
-        throw error
+    // Losing a start race is not a boot failure: a superseded dial re-enters
+    // the SAME ensure path instead of adopting a raw slot promise, so
+    // ensureBackend() applies its profile descriptor (sharedPrimary) to
+    // whichever generation is current — runHermesStart re-returns the
+    // published promise. Bounded because every redial joins a strictly newer
+    // generation; exhausting the bound surfaces the real error, matching the
+    // "fail only when no newer attempt ever publishes" contract.
+    for (let redial = 0; ; redial++) {
+      try {
+        connection = await backendDialClaims.run(scopeKey, dial)
+        break
+      } catch (error) {
+        if (!isSupersededStartError(error) || redial >= 4) {
+          throw error
+        }
       }
-    } else {
-      throw error
     }
   } finally {
     clearSpawnPriority()
