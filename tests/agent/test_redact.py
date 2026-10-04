@@ -19,6 +19,31 @@ def _ensure_redaction_enabled(monkeypatch):
 
 class TestKnownPrefixes:
 
+    @pytest.mark.parametrize("body_length", [20, 48])
+    @pytest.mark.parametrize("template", ["{}", "export HERMES_CUSTOM_AGY_PROXY_API_KEY={}", '{{"value": "{}"}}'])
+    def test_cliproxy_client_key_redacted_on_every_surface(self, body_length, template):
+        from agent.redact import redact_terminal_output
+
+        token = "cpa_sk_" + ("Ab9" * 16)[:body_length]
+        text = template.format(token)
+        for result in (
+            redact_sensitive_text(text),
+            redact_sensitive_text(text, code_file=True),
+            redact_sensitive_text(text, file_read=True),
+            redact_terminal_output(text, ".venv/bin/python -m pm.environments --format sh"),
+        ):
+            assert token not in result
+            assert token[7:-4] not in result
+            assert redact_sensitive_text(result, code_file=True) == result
+
+    @pytest.mark.parametrize("text", ["cpa_sk_", "cpa_sk_short", "cpa_sk_" + "a" * 19])
+    def test_cliproxy_short_prefix_is_not_a_secret(self, text):
+        from agent.redact import redact_terminal_output
+
+        assert redact_sensitive_text(text) == text
+        assert redact_sensitive_text(text, file_read=True) == text
+        assert redact_terminal_output(text, "git log --stat") == text
+
     def test_dotted_sk_and_prefixless_zhipu_keys_fully_masked_on_every_surface(self):
         """A key whose body carries dots must never leave a cleartext tail, and the
         prefix-less Zhipu ``id.secret`` shape must mask at all: on the terminal
