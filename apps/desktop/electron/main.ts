@@ -70,7 +70,11 @@ import {
   REAP_PROBE_TIMEOUT_MS
 } from './backend-claim'
 import { dashboardFallbackArgs, serveBackendArgs } from './backend-command'
-import { createBackendConnectionState } from './backend-connection-state'
+import {
+  createBackendConnectionState,
+  isSupersededStartError,
+  SupersededStartError
+} from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
 import type { HostBackendRecord } from './backend-discovery'
 import { buildDesktopBackendEnv, pooledProfileBackendEnv, profileBackendParentEnv } from './backend-env'
@@ -12927,7 +12931,17 @@ function reportPrimaryRecoveryCrashLoop(code: number | null, signal: string | nu
 const firstLine = (text: string): string => (text || '').split('\n').find(Boolean) || ''
 
 function runPrimaryRecoverySpawn(code: number | null, signal: string | null) {
-  startHermes({ supervisorRecovery: true }).catch(respawnError => {
+  startHermes({ supervisorRecovery: true }).catch(async (respawnError): Promise<void> => {
+    // A superseded respawn did not fail: a newer attempt (usually the
+    // renderer's own hermes:connection dial) took the slot and IS the
+    // recovery. Do not log "respawn failed", spend a crash-loop retry, or
+    // touch the recovery budget — adopting the current promise happens where
+    // the loser's consumer needs it (hermes:connection / ensureBackend), and
+    // the newer attempt's ready resets the latch as usual.
+    if (isSupersededStartError(respawnError)) {
+      return
+    }
+
     rememberLog(`[supervisor] backend respawn failed: ${firstLine(respawnError.message)}`)
 
     // Terminal boot failures still own their existing recovery UI. Only a
@@ -13319,7 +13333,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     if (!processOwner) {
       await localBackendLifecycle.stop(hermesProcess)
       releaseBackendChild(hermesProcess)
-      throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+      throw new SupersededStartError()
     }
 
     hermesProcess.stdout.on('data', rememberLog)
@@ -13337,7 +13351,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
       if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
         rememberLog(`Ignoring stale Hermes backend error: ${error.message}`)
         scheduleUnexpectedPrimaryRecovery({ error: error.message, ready: backendReady })
-        rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
+        rejectBackendStart?.(new SupersededStartError())
 
         return
       }
@@ -13369,7 +13383,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         scheduleUnexpectedPrimaryRecovery({ code, signal, ready: backendReady })
 
         if (!backendReady) {
-          rejectBackendStart?.(new Error('Hermes backend start was superseded by a newer connection attempt.'))
+          rejectBackendStart?.(new SupersededStartError())
         }
 
         return
@@ -13498,6 +13512,13 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     await backendConnectionState.stopProcess(localBackendLifecycle.stop)
 
     if (error instanceof FirstRunSetupResetError) {
+      throw error
+    }
+
+    // Losing the race to a newer attempt is not a boot failure: don't latch
+    // it, don't flip the boot UI to an error, just rethrow so the caller's
+    // superseded handling (connectDesktopProfileRoute adoption) decides.
+    if (isSupersededStartError(error)) {
       throw error
     }
 
@@ -15606,6 +15627,22 @@ async function connectDesktopProfileRoute(
         ? ensureRegistryBackend(route.connectionId, route.profile, '', { spawnPriority })
         : ensureBackend(route.profile, { spawnPriority })
     )
+  } catch (error) {
+    // Losing a start race is not a boot failure: while the supervisor respawn
+    // is still resolving, a newer attempt (ours included) owns the slot and
+    // its result is the answer the renderer wants. Fail with this error only
+    // when no newer attempt ever publishes.
+    if (isSupersededStartError(error)) {
+      const current = backendConnectionState.getPendingPromise() ?? backendConnectionState.getPromise()
+
+      if (current) {
+        connection = await current
+      } else {
+        throw error
+      }
+    } else {
+      throw error
+    }
   } finally {
     clearSpawnPriority()
   }

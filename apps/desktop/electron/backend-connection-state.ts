@@ -14,6 +14,30 @@ interface PendingBackendStop<TProcess> {
   failed: boolean
 }
 
+/**
+ * "This attempt lost the race to a newer connection attempt." Replacing a
+ * backend is normal (skew retirement + respawn, a renderer dial while the
+ * supervisor recovers), so a loser must not surface as a startup failure.
+ * Callers branch on this type instead of matching the message string.
+ */
+export class SupersededStartError extends Error {
+  readonly superseded = true
+
+  constructor() {
+    super('Hermes backend start was superseded by a newer connection attempt.')
+    this.name = 'SupersededStartError'
+  }
+}
+
+export function isSupersededStartError(error: unknown): error is SupersededStartError {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      (error as { name?: unknown }).name === 'SupersededStartError' &&
+      (error as { superseded?: unknown }).superseded === true
+  )
+}
+
 export interface BackendConnectionState<TProcess, TConnection> {
   startAttempt(): BackendConnectionAttempt<TConnection>
   setPromise(attempt: BackendConnectionAttempt<TConnection>, promise: Promise<TConnection>): boolean
@@ -49,6 +73,12 @@ export function createBackendConnectionState<TProcess, TConnection>(): BackendCo
     pendingPromise = null
 
     return currentProcess
+  }
+
+  function assertCurrentAttempt(attempt: BackendConnectionAttempt<TConnection>): void {
+    if (attempt.generation !== generation) {
+      throw new SupersededStartError()
+    }
   }
 
   return {
@@ -89,11 +119,7 @@ export function createBackendConnectionState<TProcess, TConnection>(): BackendCo
       return attempt.generation === generation
     },
 
-    assertCurrentAttempt(attempt: BackendConnectionAttempt<TConnection>): void {
-      if (attempt.generation !== generation) {
-        throw new Error('Hermes backend start was superseded by a newer connection attempt.')
-      }
-    },
+    assertCurrentAttempt,
 
     attachProcess(
       attempt: BackendConnectionAttempt<TConnection>,
