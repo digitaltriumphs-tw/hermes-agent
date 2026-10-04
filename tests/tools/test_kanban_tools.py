@@ -82,6 +82,77 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+@pytest.fixture
+def chinese_worker(worker_env):
+    from tools import kanban_tools as kt
+    with kt._board(None) as (kb, conn):
+        conn.execute("UPDATE tasks SET title=? WHERE id=?", ("中文任務", worker_env))
+        for _ in range(55):
+            kb.add_comment(conn, worker_env, author="test-worker", body="中文留言")
+    return worker_env
+
+
+@pytest.mark.parametrize("handler,args", [
+    ("_handle_show", {}),
+    ("_ok", {"message": "中文結果"}),
+    ("_handle_list", {}),
+    ("_handle_attachments", {}),
+])
+def test_kanban_results_preserve_unicode(chinese_worker, monkeypatch, handler, args):
+    from tools import kanban_tools as kt
+    monkeypatch.setattr(kt, "_require_orchestrator_tool", lambda *_: None)
+    if handler == "_ok":
+        out = kt._ok(**args)
+    elif handler == "_handle_attachments":
+        import base64
+        attached = json.loads(kt._handle_attach({
+            "filename": "中文附件.txt",
+            "content_base64": base64.b64encode(b"content").decode("ascii"),
+        }))
+        assert attached["ok"]
+        out = getattr(kt, handler)(args)
+    else:
+        out = getattr(kt, handler)(args)
+    assert "中文" in out
+    assert "\\u4e2d" not in out
+    json.loads(out)
+
+
+@pytest.mark.parametrize("args", [{}, {"include_events": False}, {"include_events": "false"}])
+def test_show_defaults_to_event_count(chinese_worker, args):
+    from tools import kanban_tools as kt
+    with kt._board(None) as (kb, conn):
+        expected = len(kb.list_events(conn, chinese_worker))
+    out = json.loads(kt._handle_show(args))
+    assert "events" not in out
+    assert out["event_count"] == expected
+    assert expected > 50
+
+
+@pytest.mark.parametrize("value", [True, "true"])
+def test_show_events_opt_in_preserves_latest_fifty(chinese_worker, value):
+    from tools import kanban_tools as kt
+    with kt._board(None) as (kb, conn):
+        events = kb.list_events(conn, chinese_worker)
+        expected = [kt._fields(event, kt._EVENT_FIELDS) for event in events[-50:]]
+    out = json.loads(kt._handle_show({"include_events": value}))
+    assert out["events"] == expected
+    assert out["event_count"] == len(events)
+
+
+def test_show_rejects_invalid_include_events(worker_env):
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_show({"include_events": "invalid"}))
+    assert "include_events must be" in out["error"]
+
+
+def test_show_schema_exposes_event_opt_in():
+    from tools.kanban_tools_schemas import KANBAN_SHOW_SCHEMA
+    prop = KANBAN_SHOW_SCHEMA["parameters"]["properties"]["include_events"]
+    assert prop["type"] == "boolean"
+    assert "event" in prop["description"].lower()
+
+
 def test_show_bare_call_outside_worker_returns_orientation_not_error(monkeypatch, worker_env):
     """#91431: chat profiles with the kanban toolset call kanban_show bare to orient
     themselves; with no dispatcher task in scope there is nothing to show, so the

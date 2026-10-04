@@ -47,7 +47,8 @@ KANBAN_SHOW_SCHEMA = _schema(
     (
         "Read a task's full state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
+        "and event_count. Set include_events=true for the latest 50 events. "
+        "Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
         "pre-formatted ``worker_context`` string suitable for inclusion "
         "verbatim in your reasoning. Outside a dispatcher-spawned worker "
@@ -56,6 +57,7 @@ KANBAN_SHOW_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "include_events": _prop("boolean", "Include the latest 50 events; omitted by default. event_count always reports the full count."),
     },
     [],
 )

@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import no_cache_check_fn, registry, tool_error
+from tools.registry import no_cache_check_fn, registry, tool_error, tool_result
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
@@ -333,7 +333,7 @@ def _existing_task(kb, conn, tid: str):
 
 
 def _ok(**fields: Any) -> str:
-    return json.dumps({"ok": True, **fields})
+    return tool_result({"ok": True, **fields})
 
 
 def _ok_landed(kb, conn, tid: str, default_status: str, **extra: Any) -> str:
@@ -661,13 +661,14 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state with an event count; last 50 events only on request."""
+    include_events = _parse_bool_arg(args, "include_events")
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
         # should I be looking at". A chat profile cannot set HERMES_KANBAN_TASK,
         # so an error naming the env var is dead end (#91431) — answer instead.
-        return json.dumps({
+        return tool_result({
             "current_task": None,
             "hint": (
                 "No dispatcher-assigned task in this session, so there is no "
@@ -676,7 +677,8 @@ def _handle_show(args: dict, **kw) -> str:
         })
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        events = kb.list_events(conn, tid)
+        data = {
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -685,11 +687,14 @@ def _handle_show(args: dict, **kw) -> str:
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+            "event_count": len(events),
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}
+        if include_events:
+            # Capped; full log via CLI.
+            data["events"] = [_fields(e, _EVENT_FIELDS) for e in events[-50:]]
+        return tool_result(data)
 
 
 @_kanban_handler("kanban_list")
@@ -714,7 +719,7 @@ def _handle_list(args: dict, **kw) -> str:
             tenant=args.get("tenant"), include_archived=include_archived, limit=limit + 1)
         truncated = len(rows) > limit
         tasks = rows[:limit]
-        return json.dumps({
+        return tool_result({
             "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
             "count": len(tasks), "limit": limit, "truncated": truncated,
             "next_limit": (min(limit * 2, KANBAN_LIST_MAX_LIMIT)
@@ -1067,7 +1072,7 @@ def _handle_attachments(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         _existing_task(kb, conn, tid)
-        return json.dumps({
+        return tool_result({
             "ok": True, "task_id": tid,
             "attachments": [
                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
