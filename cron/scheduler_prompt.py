@@ -346,12 +346,10 @@ def _build_job_prompt(
     if prompt:
         from agent.skill_commands import append_user_instruction
         parts.append("")
-        # Skill blocks are stable per job config; the appended instruction is volatile per-run.
-        # Declare that boundary for the Anthropic cache planner.
-        # The skill blocks (and any skipped-skill notice) above are stable per job config; the appended
-        # instruction carries the volatile per-run data (cron hint + prompt + script output + run context).
-        # See #81867.
-        stable_prefix = append_user_instruction(parts, prompt)
+        # Skill blocks and the cron delivery/recursion wrapper are fixed; runtime
+        # script output, notepad and run context remain in the unmarked tail.
+        # Extend only the declared boundary, never the assembled prompt's bytes.
+        stable_prefix = append_user_instruction(parts, prompt) + _CRON_HINT
     assembled = _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
     if (
         stable_prefix

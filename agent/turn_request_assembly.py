@@ -206,6 +206,9 @@ def assemble_api_request(
     if agent._use_prompt_caching and agent.provider != "moa":
         from agent.prompt_caching import envelope_tool_part_cache_markers_supported
 
+        from run_agent import _session_source_for_agent
+
+        _cache_source = _session_source_for_agent(getattr(agent, "platform", None))
         _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
         _initial_cache_plan = build_prompt_cache_plan(
             api_messages,
@@ -215,6 +218,10 @@ def assemble_api_request(
             cache_ttl=effective_cache_ttl(
                 agent._cache_ttl, provider=agent.provider, model=agent.model
             ),
+            stable_cache_ttl=effective_cache_ttl(
+                agent._cache_ttl, provider=agent.provider, model=agent.model,
+                source=_cache_source, stable_prefix=True,
+            ) if _cache_source == "cron" and agent._use_native_cache_layout else None,
             native_anthropic=agent._use_native_cache_layout,
             static_system_prefix=(
                 _static_system_prefix if isinstance(_static_system_prefix, str) else None

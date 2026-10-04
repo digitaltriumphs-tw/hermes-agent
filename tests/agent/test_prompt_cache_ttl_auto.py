@@ -21,6 +21,7 @@ def test_real_agent_resolves_auto_from_its_platform(tmp_path, monkeypatch):
     caching itself stays enabled on both (auto is a tier choice, never a disable)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
     (tmp_path / "config.yaml").write_text(
         "prompt_caching:\n  cache_ttl: auto\nmodel:\n  default: anthropic/claude-sonnet-4.6\n", encoding="utf-8")
     from run_agent import AIAgent

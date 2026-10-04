@@ -1,8 +1,8 @@
 """Anthropic prompt caching strategy — pure functions, no AIAgent dependency.
 
-Default layout: 4 cache_control breakpoints — the static system prefix, the end of the
-system prompt, and the last 2 non-system messages (without a static prefix: one system
-breakpoint plus the last 3 messages). All markers share one TTL (5m or 1h).
+Default layout: at most 4 cache_control breakpoints. Builder-declared user scaffolds
+retain an anchor so their block shape cannot drift when the last-N markers move.
+Cron native-Anthropic fixed prefixes use 1h; growing output uses the session tier.
 """
 
 import copy
@@ -64,6 +64,23 @@ def _apply_cache_marker(msg: dict, cache_marker: dict, native_anthropic: bool = 
             msg["content"] = [_text_part(content, cache_marker)]
     elif isinstance(content, list) and content and isinstance(content[-1], dict):
         content[-1]["cache_control"] = cache_marker
+
+
+def _mark_stable_user_prefix(messages: list, marker: dict, *, native_anthropic: bool,
+                             tool_part_markers: bool = True) -> int | None:
+    """Keep the builder-declared first scaffold's block boundary on every request.
+
+    A moving last-N marker used to turn this two-block message back into one block
+    on call #2. Identical text is not an identical cache prefix when block shape changes.
+    """
+    for index, message in enumerate(messages):
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, str) and find_stable_prefix(content):
+            messages[index] = copy.deepcopy(message)
+            _apply_cache_marker(messages[index], marker, native_anthropic=native_anthropic,
+                                tool_part_markers=tool_part_markers)
+            return index
+    return None
 
 
 def _can_carry_marker(msg: dict, native_anthropic: bool, tool_part_markers: bool = True) -> bool:
@@ -128,12 +145,17 @@ def auto_cache_ttl_for_source(source: str | None) -> str:
     return "5m" if (source or "").strip().lower() in MACHINE_PACED_SOURCES else "1h"
 
 
-def effective_cache_ttl(ttl: str | None, *, model: str = "", provider: str = "") -> str:
+def effective_cache_ttl(ttl: str | None, *, model: str = "", provider: str = "",
+                        source: str | None = None, stable_prefix: bool = False) -> str:
     """Clamp a requested cache TTL to what the destination route supports (``None`` → ``5m``).
 
     Qwen/Alibaba routes drop ``1h`` (→ ``5m``) except on ``MEASURED_1H_PROVIDERS`` minus
     ``NO_1H_TIER_MODELS``; that check runs BEFORE the generic Qwen clamp, which would swallow it.
     """
+    # Cron scaffolds repeat across wakes, while the changing output stays session-tier.
+    # Resolve here before the existing destination clamp; there is only one TTL owner.
+    if stable_prefix and (source or "").strip().lower() == "cron":
+        ttl = "1h"
     if ttl != "1h":
         return ttl or "5m"
     provider_lower = (provider or "").lower()
@@ -190,7 +212,9 @@ def strip_anthropic_cache_control(api_messages: List[Dict[str, Any]]) -> List[Di
         # The skill split is the only decoration marking the FIRST part of a user message,
         # so the shape alone identifies it even after the prefix registry evicted the entry.
         skill_split_shape = (role == "user" and len(content) == 2 and all(isinstance(p, dict) for p in content)
-                             and "cache_control" in content[0] and "cache_control" not in content[1])
+                             and "cache_control" in content[0]
+                             and ("cache_control" not in content[1] or find_stable_prefix(
+                                 "".join(p.get("text", "") for p in content)) == content[0].get("text")))
         if _has_part_marker(content):
             content = msg["content"] = [
                 {k: v for k, v in part.items() if k != "cache_control"}
@@ -261,6 +285,7 @@ def build_prompt_cache_plan(
     api_messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] | None, *,
     cache_ttl: str = "5m", native_anthropic: bool = False, static_system_prefix: str | None = None,
     direct_native_tool_cache: bool = False, tool_part_markers: bool = True,
+    stable_cache_ttl: str | None = None,
 ) -> PromptCachePlan:
     """Build copy-on-write cache sections for one resolved request destination
     (``tool_part_markers=False`` keeps markers off role:tool parts on LiteLLM-style routes)."""
@@ -275,18 +300,25 @@ def build_prompt_cache_plan(
     if not direct_native_tool_cache or not planned_tools:
         planned_messages = apply_anthropic_cache_control(
             messages, cache_ttl=cache_ttl, native_anthropic=native_anthropic,
-            static_system_prefix=static_system_prefix, tool_part_markers=tool_part_markers)
+            static_system_prefix=static_system_prefix, tool_part_markers=tool_part_markers,
+            stable_cache_ttl=stable_cache_ttl)
         return PromptCachePlan(messages=planned_messages, tools=planned_tools)
 
     marker = _build_marker(cache_ttl)
+    stable_marker = _build_marker(stable_cache_ttl or cache_ttl)
     if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
         # Tool-cache layout: only the static prefix carries a system-side marker; the
         # volatile suffix's budget is spent on the tools array.
         messages[0] = copy.deepcopy(messages[0])
-        _apply_system_cache_markers(messages[0], marker, static_system_prefix,
+        _apply_system_cache_markers(messages[0], stable_marker, static_system_prefix,
                                     native_anthropic=True, mark_suffix=False, fallback_to_whole=False)
-    planned_tools[-1]["cache_control"] = dict(marker)
-    for endpoint in _completed_transaction_endpoint_indexes(messages, native_anthropic=True)[-2:]:
+    planned_tools[-1]["cache_control"] = dict(stable_marker)
+    anchor = _mark_stable_user_prefix(messages, stable_marker, native_anthropic=True)
+    endpoints = _completed_transaction_endpoint_indexes(messages, native_anthropic=True)
+    if anchor is not None and stable_cache_ttl is None:
+        endpoints = [i for i in endpoints if i != anchor]
+    available = min(2, 4 - _count_cache_markers(messages, planned_tools))
+    for endpoint in endpoints[-available:] if available else []:
         messages[endpoint] = copy.deepcopy(messages[endpoint])
         _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
 
@@ -296,6 +328,7 @@ def build_prompt_cache_plan(
 def apply_anthropic_cache_control(
     api_messages: List[Dict[str, Any]], cache_ttl: str = "5m", native_anthropic: bool = False,
     static_system_prefix: str | None = None, tool_part_markers: bool = True,
+    stable_cache_ttl: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Apply Anthropic cache-control markers to API messages.
 
@@ -323,12 +356,19 @@ def apply_anthropic_cache_control(
     breakpoints_used = 0
     if messages[0].get("role") == "system":
         messages[0] = copy.deepcopy(messages[0])
-        breakpoints_used = _apply_system_cache_markers(messages[0], marker, static_system_prefix,
+        breakpoints_used = _apply_system_cache_markers(messages[0], _build_marker(stable_cache_ttl or cache_ttl), static_system_prefix,
                                                        native_anthropic=native_anthropic)
 
     non_sys = [i for i, m in enumerate(messages) if m.get("role") != "system"
                and _can_carry_marker(m, native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)]
-    for idx in non_sys[-(4 - breakpoints_used):]:
+    anchor = _mark_stable_user_prefix(messages, _build_marker(stable_cache_ttl or cache_ttl),
+                                      native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)
+    if anchor is not None:
+        breakpoints_used += 1
+        if stable_cache_ttl is None:
+            non_sys = [i for i in non_sys if i != anchor]
+    available = 4 - breakpoints_used
+    for idx in non_sys[-available:] if available else []:
         messages[idx] = copy.deepcopy(messages[idx])
         _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic, tool_part_markers=tool_part_markers)
 
