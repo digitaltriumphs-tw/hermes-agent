@@ -2,27 +2,27 @@
 
 import copy
 import pytest
-import agent.prompt_cache_boundary as boundary
-from agent.prompt_caching import build_prompt_cache_plan, _count_cache_markers
+from agent.prompt_cache_boundary import register_stable_prefix
+from agent.prompt_caching import build_prompt_cache_plan
 
 SYSTEM = "static\ncontext"
 PREFIX = "skill scaffold\n"
 
 
-@pytest.fixture(autouse=True)
-def isolated_boundary(monkeypatch):
-    from collections import OrderedDict
-    monkeypatch.setattr(boundary, "_prefixes", OrderedDict())
-    boundary.register_stable_prefix(PREFIX)
-
-
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("tool_cache", [False, True])
 def test_first_request_blocks_survive_second_request(native, tool_cache):
+    # Registration is idempotent; the canonical runner isolates this test file
+    # in its own process. Use the public builder contract, not registry internals.
+    register_stable_prefix(PREFIX)
     first = [{"role": "system", "content": SYSTEM},
-             {"role": "user", "content": PREFIX + "changing output"}]
-    second = first + [{"role": "assistant", "content": "reply"},
-                      {"role": "user", "content": "follow-up"}]
+             {"role": "user", "content": PREFIX + "Script Output\n你好 😀\r\n"}]
+    # Call #2 follows a tool round, not another human turn. Only the last-N
+    # marker selection moves: the transcript must keep every message and byte.
+    second = first + [{"role": "assistant", "content": "inspect", "tool_calls": [
+        {"id": "read-1", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+    ]}, {"role": "tool", "tool_call_id": "read-1", "content": "result"}]
+    original = copy.deepcopy(second)
     tools = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
     kwargs = dict(native_anthropic=native, static_system_prefix="static",
                   direct_native_tool_cache=tool_cache)
@@ -34,9 +34,19 @@ def test_first_request_blocks_survive_second_request(native, tool_cache):
     assert [p["text"] for p in p1.messages[1]["content"]] == [
         p["text"] for p in p2.messages[1]["content"]]
     assert p1.messages[1]["content"][0]["cache_control"] == p2.messages[1]["content"][0]["cache_control"]
-    assert _count_cache_markers(p2.messages, p2.tools) <= 4
-    assert first == [{"role": "system", "content": SYSTEM},
-                     {"role": "user", "content": PREFIX + "changing output"}]
+    for plan, transcript in [(p1, original[:2]), (p2, original)]:
+        assert len(plan.messages) == len(transcript)
+        for before, after in zip(transcript, plan.messages):
+            assert isinstance(before["content"], str)
+            content = after["content"]
+            text = content if isinstance(content, str) else "".join(p["text"] for p in content)
+            assert text.encode("utf-8") == before["content"].encode("utf-8")
+        marked_items = list(plan.messages) + plan.tools + [
+            part for msg in plan.messages if isinstance(msg.get("content"), list)
+            for part in msg["content"]
+        ]
+        assert sum("cache_control" in item for item in marked_items) <= 4
+    assert second == original
 
 
 def test_plain_messages_retain_legacy_layout():
