@@ -393,6 +393,15 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
     return not _pid_recycled(pid, started_at)
 
 
+def live_worker_runs(conn: sqlite3.Connection) -> list[dict]:
+    """Unfinished runs whose recorded worker identity is still alive on this host."""
+    rows = conn.execute(
+        "SELECT id, task_id, worker_pid, worker_started_at, max_runtime_seconds "
+        "FROM task_runs WHERE ended_at IS NULL AND worker_pid IS NOT NULL"
+    ).fetchall()
+    return [dict(row) for row in rows if _worker_alive(row["worker_pid"], row["worker_started_at"])]
+
+
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
@@ -1974,20 +1983,26 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
+        from hermes_cli.backend_retirement import retirement
+
+        # Freeze the claim -> spawn -> durable PID handoff, not just its preceding snapshot.
+        with retirement.work() as admitted:
+            if not admitted:
+                return DispatchResult()
+            return _dispatch_once_locked(
+                conn,
+                spawn_fn=spawn_fn,
+                ttl_seconds=ttl_seconds,
+                dry_run=dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=failure_limit,
+                stale_timeout_seconds=stale_timeout_seconds,
+                board=board,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconcile_orphans=reconcile_orphans,
+            )
 
     try:
         db_path = _kb.kanban_db_path(board=board)

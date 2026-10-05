@@ -6,9 +6,50 @@ close the check/use race: every source of new work must reserve admission before
 
 from contextlib import contextmanager
 import logging
+import os
+from pathlib import Path
 import secrets
+import sqlite3
 import threading
 import time
+
+
+def live_kanban_runs(parent_pid=None):
+    """Read the canonical boards' live runs owned by this process tree, without mutations.
+
+    ``parent_pid`` lets external diagnostics ask about a gateway rather than their own CLI.
+    Board pins and worker fingerprints remain owned by Kanban, not the retirement policy.
+    """
+    import psutil
+    from hermes_cli.kanban_db import get_current_board, list_boards, pin_first_board_resolution
+    from hermes_cli.kanban_db_dispatch import live_worker_runs
+
+    parent_pid = os.getpid() if parent_pid is None else parent_pid
+    runs, paths = [], set()
+    with pin_first_board_resolution():
+        boards = list_boards()
+        current = get_current_board()
+    # A pinned DB can appear under every slug. Attribute it to the canonical active board.
+    boards.sort(key=lambda board: board["slug"] != current)
+    for board in boards:
+        path = Path(board["db_path"]).resolve()
+        if path in paths or not path.exists():
+            continue
+        paths.add(path)
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
+        conn.row_factory = sqlite3.Row
+        try:
+            candidates = live_worker_runs(conn)
+        finally:
+            conn.close()
+        for run in candidates:
+            try:
+                if parent_pid not in {p.pid for p in psutil.Process(run["worker_pid"]).parents()}:
+                    continue
+            except psutil.NoSuchProcess:
+                continue
+            runs.append({**run, "board": board["slug"]})
+    return runs
 
 
 class RetirementFence:
@@ -26,6 +67,7 @@ class RetirementFence:
         self._committed = False
         self._expires_at = 0.0
         self._now = time.monotonic
+        self._worker_deferred_at = {}
 
     def _expire(self):
         if self._token is not None and not self._committed and self._now() >= self._expires_at:
@@ -56,7 +98,12 @@ class RetirementFence:
             if admitted:
                 self.release()
 
-    def prepare(self):
+    def reset_worker_deferral(self, *, reason="cooperative"):
+        """A withdrawn retirement reason ends its continuous worker grace period."""
+        with self._lock:
+            self._worker_deferred_at.pop(reason, None)
+
+    def prepare(self, *, reason="cooperative"):
         from hermes_cli.web_server_idle_proof import idle_proof
 
         with self._lock:
@@ -70,7 +117,23 @@ class RetirementFence:
         # some callers already hold a session/cron lock when reserving their work.
         verdict = None
         try:
-            verdict = idle_proof()["idle"]
+            proof = idle_proof()
+            verdict = proof["idle"]
+            if proof.get("reason") == "live_kanban_runs":
+                with self._lock:
+                    started = self._worker_deferred_at.setdefault(reason, self._now())
+                    elapsed = self._now() - started
+                limit = proof["max_runtime_seconds"]
+                if elapsed >= limit:
+                    logging.getLogger(__name__).warning(
+                        "retiring after %.0fs worker deferral limit: %s live kanban runs",
+                        limit, proof["live_kanban_runs"])
+                    verdict = True
+                else:
+                    logging.getLogger(__name__).warning(
+                        "deferring retirement: %s live kanban runs", proof["live_kanban_runs"])
+            else:
+                self.reset_worker_deferral(reason=reason)
         except Exception:
             logging.getLogger(__name__).warning("Retirement idle probe unavailable", exc_info=True)
         finally:

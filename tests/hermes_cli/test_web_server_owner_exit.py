@@ -51,8 +51,11 @@ class _Fence:
     def __init__(self, idle: bool):
         self.idle, self.committed = idle, False
 
-    def prepare(self):
+    def prepare(self, *, reason="cooperative"):
         return {"ok": True, "idle": True, "token": "t"} if self.idle else {"ok": False, "idle": False}
+
+    def reset_worker_deferral(self, *, reason="cooperative"):
+        pass
 
     def commit(self, token):
         self.committed = token == "t"

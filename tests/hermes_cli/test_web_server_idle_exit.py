@@ -7,7 +7,7 @@ from starlette.testclient import TestClient
 
 import hermes_cli.web_server as ws_mod
 from hermes_cli.web_server_idle_exit import (
-    IdleClientTracker, should_exit_idle, start_idle_watchdog, wrap_asgi_with_ws_tracking)
+    IdleClientTracker, start_idle_watchdog, wrap_asgi_with_ws_tracking)
 
 
 def test_ws_sessions_are_counted_at_the_asgi_boundary_for_any_route():
@@ -40,22 +40,34 @@ def test_ws_sessions_are_counted_at_the_asgi_boundary_for_any_route():
     assert tracker.live_count() == 0  # a refused (never accepted) upgrade is not a client
 
 
-def test_exit_only_after_grace_with_no_client_and_no_running_turn():
+def test_exit_only_after_grace_with_no_client_and_fence_permission():
+    from hermes_cli.backend_retirement import RetirementFence
+    from types import SimpleNamespace
+
     clock = {"t": 0.0}
     tracker = IdleClientTracker(now=lambda: clock["t"])
     grace = 900.0
-    assert should_exit_idle(tracker, grace, probe=lambda: False) is False  # just started
+
+    def exits(fence=None):
+        server = SimpleNamespace(should_exit=False)
+        start_idle_watchdog(server, tracker, grace_s=grace, poll_s=0.001,
+                            fence=fence or RetirementFence(), max_polls=3).join(5)
+        return server.should_exit
+
+    assert exits() is False
     clock["t"] = 901.0
-    assert should_exit_idle(tracker, grace, probe=lambda: False) is True
-    assert should_exit_idle(tracker, grace, probe=lambda: True) is False   # turn running
-    assert should_exit_idle(tracker, grace, probe=lambda: None) is False   # indeterminate: fail closed
+    assert exits() is True
+    busy = RetirementFence()
+    with busy.work() as admitted:
+        assert admitted
+        assert exits(busy) is False
     tracker.on_open()
     clock["t"] = 5000.0
-    assert should_exit_idle(tracker, grace, probe=lambda: False) is False  # a client is connected
+    assert exits() is False
     tracker.on_close()
-    assert should_exit_idle(tracker, grace, probe=lambda: False) is False  # grace restarts on close
+    assert exits() is False
     clock["t"] = 5000.0 + grace + 1
-    assert should_exit_idle(tracker, grace, probe=lambda: False) is True
+    assert exits() is True
 
 
 def test_watchdog_sets_should_exit_and_only_arms_for_ssh_isolated_backends(monkeypatch):
@@ -65,7 +77,8 @@ def test_watchdog_sets_should_exit_and_only_arms_for_ssh_isolated_backends(monke
     server = _Server()
     clock = iter([0.0, 0.0, 10_000.0, 10_000.0, 10_000.0, 10_000.0])
     tracker = IdleClientTracker(now=lambda: next(clock, 10_000.0))
-    start_idle_watchdog(server, tracker, grace_s=1.0, poll_s=0.01, probe=lambda: False).join(timeout=5)
+    from hermes_cli.backend_retirement import RetirementFence
+    start_idle_watchdog(server, tracker, grace_s=1.0, poll_s=0.01, fence=RetirementFence()).join(timeout=5)
     assert server.should_exit is True
 
     # The uvicorn builder wraps the app + arms tunnel pings ONLY when a session token was handed over.

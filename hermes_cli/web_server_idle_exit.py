@@ -11,8 +11,8 @@ Two pieces, both scoped to the SSH-isolated case (a session token was handed ove
 * An ASGI wrapper counts accepted WebSocket connections (every dashboard WS route: /api/ws,
   /api/pty, /api/console, /api/pub, /api/events, /api/audio/speak-stream) without touching the
   handlers. When the count has been zero for the grace window and no agent turn is running, the
-  watchdog asks uvicorn to exit gracefully (WAL checkpoint, exit 0). An indeterminate turn probe
-  fails closed: the backend stays up.
+  watchdog asks the process-owned retirement fence to close admission before uvicorn exits.
+  An indeterminate work probe fails closed: the backend stays up.
 * Loopback normally disables uvicorn's WS ping (a dead local client sends FIN/RST). Across an SSH
   tunnel the local socket is healthy while the far end is asleep, so pings are the only way to notice
   a half-open tunnel; the isolated backend keeps a slow ping with a long timeout so a GIL-holding
@@ -137,34 +137,23 @@ def busy_ledger() -> Optional[str]:
 
 
 def turn_in_flight() -> Optional[bool]:
-    """Bool view of :func:`busy_ledger`, kept so ``should_exit_idle`` / the idle watchdog and injected
-    test probes keep their ``Optional[bool]`` contract; None when the ledgers cannot be read."""
+    """Bool view of :func:`busy_ledger`; None when the ledgers cannot be read."""
     ledger = busy_ledger()
     return None if ledger is None else bool(ledger)
 
 
-def should_exit_idle(tracker: IdleClientTracker, grace_s: float,
-                     probe: Callable[[], Optional[bool]] = turn_in_flight) -> bool:
-    """Exit only when no client has been connected for ``grace_s`` AND no turn is provably running.
-    A probe that cannot answer keeps the process (fail closed)."""
-    return tracker.idle_for() >= grace_s and probe() is False  # idle_for() is 0 while a client is connected
-
-
 def start_idle_watchdog(server, tracker: IdleClientTracker, *, grace_s: float = DEFAULT_IDLE_GRACE_S,
-                        poll_s: float = 15.0, probe: Callable[[], Optional[bool]] = turn_in_flight) -> threading.Thread:
-    """Daemon thread that sets ``server.should_exit`` once :func:`should_exit_idle` holds."""
+                        poll_s: float = 15.0, fence=None,
+                        max_polls: Optional[int] = None) -> threading.Thread:
+    """Client absence is a retirement reason, never its own permission to exit."""
+    from hermes_cli.web_server_skew_exit import _run_retirement_watchdog
 
     poll_s = min(poll_s, max(0.5, grace_s / 4))
 
-    def _loop() -> None:
-        while not getattr(server, "should_exit", False):
-            if should_exit_idle(tracker, grace_s, probe):
-                _log.warning("SSH-isolated backend idle for %.0fs with no client and no running turn; exiting.",
-                             tracker.idle_for())
-                server.should_exit = True
-                return
-            time.sleep(poll_s)
+    def _observe() -> Optional[str]:
+        if tracker.live_count() or tracker.idle_for() < grace_s:
+            return None
+        return "SSH-isolated backend idle for %.0fs with no client; retiring." % tracker.idle_for()
 
-    thread = threading.Thread(target=_loop, daemon=True, name="ssh-isolated-idle-watchdog")
-    thread.start()
-    return thread
+    return _run_retirement_watchdog(server, observe=_observe, fence=fence, poll_s=poll_s,
+                                    max_polls=max_polls, thread_name="ssh-isolated-idle-watchdog")

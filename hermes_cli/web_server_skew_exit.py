@@ -61,8 +61,10 @@ def _run_retirement_watchdog(server, *, observe: Callable[[], Optional[str]], fe
             polls += 1
             reason = observe()
             seen = seen + 1 if reason else 0
+            if not reason:
+                fence.reset_worker_deferral(reason=thread_name)
             if seen >= _CONFIRMATIONS:
-                permit = fence.prepare()
+                permit = fence.prepare(reason=thread_name)
                 if permit.get("ok") and fence.commit(permit.get("token")).get("ok"):
                     _log.warning("%s", reason)
                     server.should_exit = True

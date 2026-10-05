@@ -37,11 +37,12 @@ def pending_human_input() -> Optional[int]:
 
 
 def idle_proof(turn_probe: Callable[[], bool | str | None] = busy_ledger,
-               input_probe: Callable[[], Optional[int]] = pending_human_input) -> dict:
+               input_probe: Callable[[], Optional[int]] = pending_human_input,
+               worker_probe=None) -> dict:
     """``{"idle": True | False | None, "reason": str | None}`` plus ``"detail"`` naming the busy ledger.
 
-    ``True`` only when no turn is in flight (session table AND cron ledger) and nothing is waiting
-    on a human. ``None`` whenever either probe is indeterminate — the caller treats it exactly like
+    ``True`` only when no turn or descendant Kanban run is in flight and nothing is waiting
+    on a human. ``None`` whenever a probe is indeterminate — the caller treats it exactly like
     busy. ``turn_probe`` may answer with a bool or with :func:`busy_ledger`'s name; the name is
     surfaced as ``detail`` so a backend that refuses to retire says which work it is protecting.
     """
@@ -55,4 +56,16 @@ def idle_proof(turn_probe: Callable[[], bool | str | None] = busy_ledger,
         return {"idle": None, "reason": "input_probe_unavailable"}
     if pending:
         return {"idle": False, "reason": "awaiting_human_input"}
+    if worker_probe is None:
+        from hermes_cli.backend_retirement import live_kanban_runs
+        worker_probe = live_kanban_runs
+    try:
+        runs = worker_probe()
+    except Exception:
+        _log.warning("idle-proof Kanban worker probe unavailable", exc_info=True)
+        return {"idle": None, "reason": "worker_probe_unavailable"}
+    if runs:
+        limit = max((run["max_runtime_seconds"] for run in runs if run["max_runtime_seconds"]), default=7200)
+        return {"idle": False, "reason": "live_kanban_runs", "live_kanban_runs": len(runs),
+                "max_runtime_seconds": limit}
     return {"idle": True, "reason": None}
