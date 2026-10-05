@@ -468,6 +468,7 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
     max_line_length = get_max_line_length()
     truncated_lines = any(len(line) > max_line_length for line in page_text.split('\n'))
     result_dict = {
+        "path": path,
         "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
         "total_lines": total_lines,
         "file_size": binary.file_size,
@@ -619,13 +620,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # relative segment and hide it from every resolved-path check below.
         nt_err = get_nt_namespace_error(path, verb="Read")
         if nt_err:
-            return tool_error(nt_err)
+            return tool_error(nt_err, path=path)
 
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
             return tool_error(
                 f"Cannot read '{path}': this is a device file that would "
-                "block or produce infinite output.")
+                "block or produce infinite output.",
+                path=path)
 
         _resolved = _resolve_path_for_task(path, task_id)
 
@@ -634,6 +636,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             kind = _special_file_kind(_resolved)
             if kind is not None:
                 return json.dumps({
+                    "path": path,
                     "success": False,
                     "note": (
                         f"'{path}' is {kind}, not a regular file — reading "
@@ -647,7 +650,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # resolve() uses the process cwd and would miss a relative "auth.json".
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return tool_error(block_error)
+            return tool_error(block_error, path=path)
 
         extracted = _read_extracted_document(path, _resolved, offset, limit, task_id)
         if extracted is not None:
@@ -658,7 +661,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if has_binary_extension(str(_resolved)):
             return tool_error(
                 f"Cannot read binary file '{path}' ({_resolved.suffix.lower()}). "
-                "Use vision_analyze for images, or terminal to inspect binary files.")
+                "Use vision_analyze for images, or terminal to inspect binary files.",
+                path=path)
 
         resolved_str = str(_resolved)
         cached_not_found = _check_not_found_cache("read", resolved_str, task_id)
@@ -684,6 +688,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
         result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
         result_dict = result.to_dict()
+        result_dict.setdefault("path", path)
 
         # Failed reads cannot establish whole-file knowledge.
         _err = result_dict.get("error") or ""
