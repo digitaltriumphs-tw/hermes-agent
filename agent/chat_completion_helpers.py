@@ -1295,9 +1295,9 @@ def _reasoning_config_for_wire(agent):
     """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
 
     Once the route has answered a disable with a 400 (``agent._reasoning_disable_rejected``),
-    no disable goes out for the rest of the session: ordinary requests resend the user's own
-    config, a configured disable is stepped up or omitted, and the continuation's one-shot
-    override goes out at the floor effort for that one call.
+    no disable goes out for the rest of the session: a continuation's one-shot override goes out
+    at the floor effort for that one call, ordinary requests resend the user's own config, and a
+    configured disable is stepped up or omitted.
     """
     cfg = agent.reasoning_config
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
@@ -1313,20 +1313,21 @@ def _reasoning_config_for_wire(agent):
         from agent.reasoning_params import unset_reasoning_default
         cfg = unset_reasoning_default(agent)
     if getattr(agent, "_reasoning_disable_rejected", False):
-        # The route rejects disables. Ordinary requests resend the user's own config, so they land
-        # on the same provider cache key as every prior request. A config that is itself a disable
-        # (all that session ever sent, so nothing warm is lost) gets the floor effort from a route
+        # The route rejects disables. A thinking-only continuation (its one-shot override consumed
+        # now, or the refused override this retry replays: the only disable that differs from the
+        # user's own config) gets the floor whatever the config: the user's effort or the route
+        # default re-burns the output cap. Ordinary requests resend the user's own config, so they
+        # land on the same provider cache key as every prior request; a config that is itself a
+        # disable (all that session ever sent, so nothing warm is lost) gets the floor from a route
         # that said the disable is *mandatory-on*, nothing (route default) from a relay that does
-        # not know the field. A thinking-only continuation (its one-shot override consumed now, or
-        # the refused override this retry replays: with an enabled config only that went out
-        # ``enabled: False``) gets the floor too: the user's own effort re-burns the output cap.
+        # not know the field.
         from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
         sent = getattr(agent, "_wire_reasoning_config", None)
-        floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT} if isinstance(cfg, dict) else None
-        if isinstance(cfg, dict) and (cfg.get("enabled") is False or cfg.get("effort") == "none"):
-            wire = floored if getattr(agent, "_reasoning_floor_required", False) else None
-        elif isinstance(cfg, dict) and (ephemeral_off or (isinstance(sent, dict) and sent.get("enabled") is False)):
+        floored = {**(cfg or {}), "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+        if ephemeral_off or (isinstance(sent, dict) and sent.get("enabled") is False and sent != cfg):
             wire = floored
+        elif isinstance(cfg, dict) and (cfg.get("enabled") is False or cfg.get("effort") == "none"):
+            wire = floored if getattr(agent, "_reasoning_floor_required", False) else None
         else:
             wire = cfg
         agent._wire_reasoning_config = wire

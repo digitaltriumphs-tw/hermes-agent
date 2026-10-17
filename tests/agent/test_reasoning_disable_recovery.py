@@ -8,6 +8,8 @@ replaying the identical request until ``max_retries``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_retry_state import TurnRetryState
 
@@ -123,10 +125,12 @@ def _wire_reasoning_config(agent):
     """What the main-loop request builder hands the transport as ``reasoning_config``."""
     from agent.chat_completion_helpers import _build_api_kwargs_for_mode
 
-    def _capture(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
+    def _capture(agent, api_messages, tools_for_api, reasoning_config, *rest):
         return {"reasoning_config": reasoning_config}
 
-    with patch("agent.chat_completion_helpers._build_chat_completions_kwargs", _capture):
+    with patch("agent.chat_completion_helpers._build_chat_completions_kwargs", _capture), patch(
+        "agent.chat_completion_helpers._build_anthropic_kwargs", _capture
+    ):
         return _build_api_kwargs_for_mode(agent, [], [])["reasoning_config"]
 
 
@@ -163,13 +167,30 @@ _ADAPTIVE_ONLY_400 = (
 )
 
 
-def test_rejected_continuation_disable_retries_at_the_floor_effort():
+@pytest.mark.parametrize("api_mode, user_config, ordinary_wire", [
+    ("chat_completions", {"enabled": True, "effort": "high"}, {"enabled": True, "effort": "high"}),
+    # Effort unset on a native Claude route, or a configured disable: the route default thinks too.
+    ("anthropic_messages", None, None),
+    ("chat_completions", {"enabled": False}, None),
+])
+def test_rejected_continuation_disable_retries_at_the_floor_effort(api_mode, user_config, ordinary_wire):
     from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
 
-    agent = _WireAgent({"enabled": True, "effort": "high"})
+    floor = {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
+    agent = _WireAgent(user_config)
+    agent.api_mode = api_mode
     agent._ephemeral_reasoning_off = True
-    assert _wire_reasoning_config(agent) == {"enabled": False, "effort": "none"}  # the request that 400ed
+    assert _wire_reasoning_config(agent)["enabled"] is False  # the continuation that 400ed
     _recover(agent, _ADAPTIVE_ONLY_400)
-    assert _wire_reasoning_config(agent) == {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
-    # Only that continuation: the next ordinary request goes out at the user's own effort.
-    assert _wire_reasoning_config(agent) == {"enabled": True, "effort": "high"}
+    assert _wire_reasoning_config(agent) == floor
+    # Only continuations: the next ordinary request goes out as the user configured it.
+    assert _wire_reasoning_config(agent) == ordinary_wire
+    agent._ephemeral_reasoning_off = True
+    assert _wire_reasoning_config(agent) == floor
+
+
+def test_rejected_ordinary_disable_retries_at_the_route_default():
+    agent = _WireAgent({"enabled": False})
+    assert _wire_reasoning_config(agent) == {"enabled": False}  # an ordinary request, not a continuation
+    _recover(agent, _ADAPTIVE_ONLY_400)
+    assert _wire_reasoning_config(agent) is None
