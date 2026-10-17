@@ -153,11 +153,23 @@ def test_rejected_reasoning_level_retries_without_the_effort():
     assert any("rejects reasoning effort max" in n for n in agent.notices)
     assert not any("rejects disabling reasoning" in n for n in agent.notices)
 
-    # Control: a rejected DISABLE keeps the existing contract — the user's own enabled config
-    # goes out verbatim on the retry and the notice names the disable.
+
+# An adaptive-only Claude route refuses the thinking-only continuation's one-shot disable. Retrying
+# that continuation at the user's ``high`` re-burned the whole output cap on thinking every time
+# (4 thinking-only continuations, turn ended with no text).
+_ADAPTIVE_ONLY_400 = (
+    '"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and '
+    '"output_config.effort" to control thinking behavior.'
+)
+
+
+def test_rejected_continuation_disable_retries_at_the_floor_effort():
+    from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
+
     agent = _WireAgent({"enabled": True, "effort": "high"})
     agent._ephemeral_reasoning_off = True
     assert _wire_reasoning_config(agent) == {"enabled": False, "effort": "none"}  # the request that 400ed
-    _recover(agent, _REVERSED_400)
+    _recover(agent, _ADAPTIVE_ONLY_400)
+    assert _wire_reasoning_config(agent) == {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
+    # Only that continuation: the next ordinary request goes out at the user's own effort.
     assert _wire_reasoning_config(agent) == {"enabled": True, "effort": "high"}
-    assert any("rejects disabling reasoning" in n for n in agent.notices)

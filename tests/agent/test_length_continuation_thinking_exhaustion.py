@@ -68,18 +68,20 @@ class TestReasoningOffOneShotOverride:
         cfg = _reasoning_config_for_wire(agent)
         assert cfg == {"enabled": False, "effort": "none"}
 
-    def test_rejected_disable_resends_users_config_verbatim(self):
-        """After a 'reasoning is mandatory' 400 the retry must land on the
-        SAME provider cache key as every prior request: the ephemeral
-        continuation override is discarded and the user's own config goes
-        out unchanged. A config that is itself a disable is omitted."""
+    def test_rejected_disable_steps_the_continuation_override_up_to_the_floor(self):
+        """Once the route has refused a disable, a later thinking-only continuation's
+        one-shot override cannot go out as a disable — and the user's own high effort
+        would re-burn the output cap. It goes out at the floor effort for that call only.
+        A config that is itself a disable is omitted."""
+        from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
         from agent.chat_completion_helpers import _reasoning_config_for_wire
 
         agent = _AgentStandIn({"enabled": True, "effort": "high"})
         agent._reasoning_disable_rejected = True
         agent._ephemeral_reasoning_off = True
-        assert _reasoning_config_for_wire(agent) == {"enabled": True, "effort": "high"}
+        assert _reasoning_config_for_wire(agent) == {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
         assert agent._ephemeral_reasoning_off is False
+        assert _reasoning_config_for_wire(agent) == {"enabled": True, "effort": "high"}
 
         agent.reasoning_config = {"enabled": False}
         assert _reasoning_config_for_wire(agent) is None
