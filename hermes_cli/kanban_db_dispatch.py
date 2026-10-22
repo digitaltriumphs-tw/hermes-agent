@@ -1378,7 +1378,7 @@ def _record_task_failure(
     failure_limit: int | None = None,
     force_trip: bool = False,
     release_claim: bool = False,
-    end_run: bool = False,
+    end_run: bool = False, summary: Optional[str] = None,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
 ) -> bool:
@@ -1446,7 +1446,7 @@ def _record_task_failure(
                 if infrastructure:
                     detail["infrastructure"] = True
                 run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
+                    conn, task_id, outcome=outcome, status=outcome, summary=summary, error=error, metadata=detail,
                 )
                 _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
@@ -1473,7 +1473,7 @@ def _record_task_failure(
         if end_run:
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                conn, task_id, outcome="gave_up", status="gave_up", summary=summary, error=error,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,

@@ -54,6 +54,9 @@ class _LimitAgent:
     def _emit_status(self, *_args, **_kwargs):
         pass
 
+    def _emit_diagnostic_status(self, *_args, **_kwargs):
+        pass
+
     def _safe_print(self, *_args, **_kwargs):
         pass
 
@@ -95,13 +98,14 @@ def _finalize(
     exit_reason,
     api_call_count=60,
     pending_verification_response=None,
+    failed=False,
 ):
     return finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
         interrupted=False,
-        failed=False,
+        failed=failed,
         messages=[{"role": "user", "content": "task"}],
         conversation_history=[],
         effective_task_id="task",
@@ -190,6 +194,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         release_claim=True,
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
+        summary="composed report",
     )
 
 
@@ -404,6 +409,83 @@ def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatc
         )
 
     record.assert_not_called()
+
+
+class _InterruptedSummaryAgent(_LimitAgent):
+    def _handle_max_iterations(self, messages, api_call_count):
+        raise InterruptedError
+
+
+def _claimed_kanban_task(monkeypatch, tmp_path, *, max_retries=None):
+    """A real board with one claimed task, wired as this dispatcher-owned worker's task."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker", max_retries=max_retries)
+        assert kb.claim_task(conn, tid) is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
+
+
+@pytest.mark.parametrize(
+    ("agent_cls", "failed", "max_retries", "summary", "run_outcome", "task_status"),
+    [
+        # The summary call answered: the next attempt must see it, tripped or not.
+        (_LimitAgent, False, None, "summary from extra call", "timed_out", "ready"),
+        (_LimitAgent, False, 1, "summary from extra call", "gave_up", "blocked"),
+        # No summary was produced: the failure is recorded exactly as before.
+        (_InterruptedSummaryAgent, False, None, None, "timed_out", "ready"),
+        (_LimitAgent, True, None, None, "timed_out", "ready"),
+    ],
+)
+def test_budget_exhausted_worker_hands_its_summary_to_the_next_attempt(
+    monkeypatch, tmp_path, agent_cls, failed, max_retries, summary, run_outcome, task_status
+):
+    """The summary the budget fallback obtained closes the run as its ``summary``, so the next
+    worker's "Prior attempts" shows it instead of only "Iteration budget exhausted"."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid = _claimed_kanban_task(monkeypatch, tmp_path, max_retries=max_retries)
+
+    _finalize(agent_cls(), final_response=None, exit_reason="unknown", failed=failed)
+
+    with kbc.connect_closing() as conn:
+        (run,) = kb.list_runs(conn, tid)
+        task = kb.get_task(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+    assert (run.outcome, run.summary, task.status) == (run_outcome, summary, task_status)
+    assert run.ended_at is not None
+    assert run.error == (
+        "Iteration budget exhausted (60/60) — task could not complete within the allowed iterations"
+    )
+    assert task.consecutive_failures == 1
+    prior_attempts = context.split("## Prior attempts on this task", 1)[1]
+    assert ("summary from extra call" in prior_attempts) is (summary is not None)
+
+
+def test_budget_exhaustion_leaves_a_run_another_path_already_closed(monkeypatch, tmp_path):
+    """The budget path closes the run only through the ``_end_run`` CAS: a run another path
+    already closed keeps its own ending, summary and error."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    tid = _claimed_kanban_task(monkeypatch, tmp_path)
+    with kbc.connect_closing() as conn:
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="earlier handoff", expected_run_id=run_id)
+        (before,) = kb.list_runs(conn, tid)
+
+    _finalize(_LimitAgent(), final_response=None, exit_reason="unknown")
+
+    with kbc.connect_closing() as conn:
+        (after,) = kb.list_runs(conn, tid)
+    assert (after.outcome, after.summary, after.error, after.ended_at) == (
+        before.outcome, before.summary, before.error, before.ended_at,
+    )
 
 
 def test_finalize_turn_starts_the_title_upgrade_the_prologue_held_back():

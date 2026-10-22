@@ -45,13 +45,18 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
 
 
 def _record_kanban_budget_exhausted(
-    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
+    kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger,
+    *, summary: Optional[str],
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
     (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
+
+    ``summary`` is the handoff the budget fallback obtained for this turn (None when it
+    obtained none); it closes the run as the run's summary, which is what the next
+    worker's "Prior attempts" context shows.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
@@ -74,6 +79,7 @@ def _record_kanban_budget_exhausted(
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                summary=summary,
             )
         finally:
             with suppress(Exception):
@@ -131,6 +137,9 @@ def _resolve_budget_fallback(
         api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
     )
     preserved_verification_fallback = False
+    # The handoff this fallback obtained for the turn: the preserved candidate or the
+    # summary call's answer. An interrupt or an ineligible exit obtains none.
+    handoff_summary = None
     if (
         final_response is None and budget_exhausted and not interrupted and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
@@ -169,6 +178,8 @@ def _resolve_budget_fallback(
                 interrupted = True
                 _turn_exit_reason = interrupted_during_api_call_reason(agent)
                 final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{time.time() - _summary_start:.1f}s elapsed)."
+        if not interrupted:
+            handoff_summary = final_response
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete. Only the
@@ -191,7 +202,9 @@ def _resolve_budget_fallback(
     # closed via ``_record_task_failure`` (compare-and-swap receipt path) which is a no-op if another path
     # closed it — the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
     if _kanban_task:
-        _record_kanban_budget_exhausted(_kanban_task, api_call_count, agent.max_iterations, logger)
+        _record_kanban_budget_exhausted(
+            _kanban_task, api_call_count, agent.max_iterations, logger, summary=handoff_summary,
+        )
     return final_response, _turn_exit_reason, preserved_verification_fallback, interrupted
 
 
