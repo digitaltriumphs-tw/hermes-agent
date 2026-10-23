@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { backendScopeKey } from '@hermes/shared'
+import { useStore } from '@nanostores/react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { $apiRequestScope } from '@/api/client'
 import { restoreListedSession } from '@/app/session/hooks/use-session-actions/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -23,10 +26,10 @@ import { notify, notifyError } from '@/store/notifications'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd } from '@/store/session'
 import { untombstoneSessions } from '@/store/session-removal'
 import { forgetSessionUnread } from '@/store/session-unread'
-import { listEveryArchivedSession } from '@/store/sidebar-archive'
+import { iterateArchivedSessions } from '@/store/sidebar-archive'
 import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
 
-import { EmptyState, ListRow, SectionHeading, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
+import { EmptyState, ListRow, SectionHeading, SettingsContent, ToggleRow } from './primitives'
 import { SETTING_IDS, settingElementId } from './settings-manifest'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
 import { useSettingDeepLink } from './use-setting-deep-link'
@@ -39,6 +42,7 @@ interface SessionsSettingsProps {
 
 export function SessionsSettings({ subpage }: SessionsSettingsProps = {}) {
   useSettingDeepLink('sessions', page => subpage === undefined || page === subpage)
+  const scope = useStore($apiRequestScope)
 
   if (subpage === 'default-directory') {
     return (
@@ -48,7 +52,12 @@ export function SessionsSettings({ subpage }: SessionsSettingsProps = {}) {
     )
   }
 
-  return <ArchivedSessionsSettings includeDefaultDirectory={subpage === undefined} />
+  return (
+    <ArchivedSessionsSettings
+      includeDefaultDirectory={subpage === undefined}
+      key={backendScopeKey(scope.connectionId, scope.profile)}
+    />
+  )
 }
 
 function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultDirectory: boolean }) {
@@ -56,22 +65,82 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
   const s = t.settings.sessions
   const [sessions, setLocalSessions] = useState<SessionInfo[]>([])
   const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const pages = useRef<{
+    iterator: ReturnType<typeof iterateArchivedSessions>
+    pending: boolean
+    cancelled: boolean
+  } | null>(null)
 
-    try {
-      setLocalSessions(await listEveryArchivedSession())
-    } catch (err) {
-      notifyError(err, s.failedLoad)
-    } finally {
-      setLoading(false)
-    }
-  }, [s.failedLoad])
+  const load = useCallback(
+    async (reset = false) => {
+      if (reset && pages.current) {
+        // A successful membership change invalidates the old offset window,
+        // including an in-flight page. Reuse the existing first-page reload.
+        pages.current.cancelled = true
+      } else if (pages.current?.pending) {
+        return
+      }
+
+      const current =
+        reset || !pages.current
+          ? { iterator: iterateArchivedSessions(), pending: false, cancelled: false }
+          : pages.current
+
+      pages.current = current
+      current.pending = true
+
+      if (reset) {
+        setLocalSessions([])
+        setHasMore(false)
+        setFailed(false)
+      }
+
+      setLoading(true)
+
+      try {
+        const page = await current.iterator.next()
+
+        if (current.cancelled) {
+          return
+        }
+
+        setHasMore(!page.done && page.value.hasMore)
+
+        if (!page.done) {
+          setLocalSessions(previous => [...previous, ...page.value.sessions])
+
+          if (page.value.errors?.length) {
+            setFailed(true)
+          }
+        }
+      } catch (err) {
+        if (!current.cancelled) {
+          setFailed(true)
+          setHasMore(false)
+          notifyError(err, s.failedLoad)
+        }
+      } finally {
+        if (!current.cancelled) {
+          current.pending = false
+          setLoading(false)
+        }
+      }
+    },
+    [s.failedLoad]
+  )
 
   useEffect(() => {
-    void load()
+    void load(true)
+
+    return () => {
+      if (pages.current) {
+        pages.current.cancelled = true
+      }
+    }
   }, [load])
 
   const unarchive = useCallback(
@@ -80,6 +149,11 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
 
       try {
         await setSessionArchived(session.id, false, session.profile)
+
+        if (pages.current?.cancelled) {
+          return
+        }
+
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         // Surface it again in the sidebar without waiting for a full refresh, and
         // lift any optimistic eviction so the grouped tree shows it again too.
@@ -87,13 +161,14 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
         restoreListedSession({ ...session, archived: false })
         triggerHaptic('selection')
         notify({ durationMs: 2_000, kind: 'success', message: s.restored })
+        void load(true)
       } catch (err) {
         notifyError(err, s.unarchiveFailed)
       } finally {
         setBusyId(null)
       }
     },
-    [s]
+    [load, s]
   )
 
   const remove = useCallback(
@@ -104,7 +179,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
         title: s.deleteConfirm(sessionTitle(session))
       })
 
-      if (!ok) {
+      if (!ok || pages.current?.cancelled) {
         return
       }
 
@@ -112,6 +187,11 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
 
       try {
         await deleteSession(session.id, session.profile)
+
+        if (pages.current?.cancelled) {
+          return
+        }
+
         // Permanent delete bypasses removeSession, so retire the persisted
         // unread state here too rather than leaving it to rot.
         forgetSessionUnread([session.id, session._lineage_root_id], session.profile)
@@ -123,24 +203,29 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
         purgeInFlightTurnJournals([session.id, session._lineage_root_id])
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         triggerHaptic('warning')
+        void load(true)
       } catch (err) {
         notifyError(err, s.deleteFailed)
       } finally {
         setBusyId(null)
       }
     },
-    [s]
+    [load, s]
   )
 
-  useDeepLinkHighlight({
+  const target = useDeepLinkHighlight({
     elementId: id => `archived-session-${id}`,
     param: 'session',
-    ready: id => !loading && sessions.some(session => session.id === id)
+    ready: id => sessions.some(session => session.id === id)
   })
 
-  if (loading) {
-    return <SettingsSkeleton sections={[{ rows: 1 }, { heading: true, rows: 4 }]} />
-  }
+  // An explicit deep link may need older pages; ordinary opens stop after the
+  // first page. Keep already loaded rows usable while locating the target.
+  useEffect(() => {
+    if (target && !loading && hasMore && !sessions.some(session => session.id === target)) {
+      void load()
+    }
+  }, [hasMore, load, loading, sessions, target])
 
   return (
     <SettingsContent>
@@ -157,7 +242,7 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
         {s.archivedIntro}
       </p>
 
-      {sessions.length === 0 ? (
+      {sessions.length === 0 && !loading && !failed ? (
         <EmptyState description={s.emptyArchivedDesc} title={s.emptyArchivedTitle} />
       ) : (
         <div className="grid gap-1">
@@ -203,6 +288,26 @@ function ArchivedSessionsSettings({ includeDefaultDirectory }: { includeDefaultD
             )
           })}
         </div>
+      )}
+      {loading && (
+        <p className="py-3 text-sm text-muted-foreground" role="status">
+          {t.common.loading}
+        </p>
+      )}
+      {failed && (
+        <p className="py-3 text-sm text-muted-foreground" role="alert">
+          {s.failedLoad}
+        </p>
+      )}
+      {hasMore && (
+        <Button disabled={loading} onClick={() => void load()} size="sm" variant="textStrong">
+          {t.sidebar.loadMore}
+        </Button>
+      )}
+      {failed && (
+        <Button disabled={loading} onClick={() => void load(true)} size="sm" variant="textStrong">
+          {t.common.retry}
+        </Button>
       )}
     </SettingsContent>
   )

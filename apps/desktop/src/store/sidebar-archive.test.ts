@@ -7,6 +7,7 @@ import { $sidebarShowArchived } from './layout'
 import {
   $archivedSessions,
   $archivedSessionsLoading,
+  iterateArchivedSessions,
   listEveryArchivedSession,
   loadArchivedSessions
 } from './sidebar-archive'
@@ -63,6 +64,16 @@ describe('loadArchivedSessions', () => {
       'default',
       'work'
     ])
+  })
+
+  it('publishes healthy profile rows when another profile reports a scan failure', async () => {
+    listAllProfileSessions.mockResolvedValue({
+      sessions: [row('healthy')],
+      total: 1,
+      errors: [{ profile: 'unavailable', error: 'read failed' }]
+    })
+    await loadArchivedSessions()
+    expect($archivedSessions.get().map(session => session.id)).toEqual(['healthy'])
   })
 
   it('keeps the last successful result when a refresh fails', async () => {
@@ -167,6 +178,38 @@ describe('loadArchivedSessions', () => {
 
     expect($archivedSessions.get()).toEqual([])
     expect(listAllProfileSessions).not.toHaveBeenCalled()
+  })
+})
+
+describe('iterateArchivedSessions', () => {
+  it('makes a large archive usable after one page and drains without loss only when requested', async () => {
+    const archive = page(0, 10_557)
+    listAllProfileSessions.mockImplementation(async (limit, _min, _archived, _order, _profile, _filter, offset) => ({
+      sessions: archive.slice(offset, offset + limit),
+      total: archive.length
+    }))
+    const iterator = iterateArchivedSessions()
+    const first = await iterator.next()
+    expect(first.value).toEqual({ sessions: archive.slice(0, PAGE_SIZE), hasMore: true })
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
+
+    const loaded = [...first.value!.sessions]
+
+    for await (const next of iterator) {
+      loaded.push(...next.sessions)
+    }
+
+    expect(loaded).toEqual(archive)
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(Math.ceil(archive.length / PAGE_SIZE))
+  })
+
+  it('does not resume a paused cursor on a different profile', async () => {
+    listAllProfileSessions.mockResolvedValue({ sessions: page(0, PAGE_SIZE), total: PAGE_SIZE + 1 })
+    const iterator = iterateArchivedSessions()
+    await iterator.next()
+    $apiRequestScope.setKey('profile', 'other')
+    expect((await iterator.next()).done).toBe(true)
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
   })
 })
 

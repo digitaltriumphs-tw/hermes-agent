@@ -3,7 +3,7 @@ import { atom, computed } from 'nanostores'
 
 import { $apiRequestScope } from '@/api/client'
 import { listAllProfileSessions } from '@/api/sessions'
-import type { SessionInfo } from '@/types/hermes'
+import type { PaginatedSessions, SessionInfo } from '@/types/hermes'
 
 import { $sidebarShowArchived } from './layout'
 import { $sessions } from './session'
@@ -14,8 +14,14 @@ import { $sessions } from './session'
 // deep archive from re-reading that prefix once per 200 rows.
 const ARCHIVED_FETCH_PAGE_SIZE = 500
 
+export interface ArchivedSessionPage {
+  sessions: SessionInfo[]
+  hasMore: boolean
+  errors?: PaginatedSessions['errors']
+}
+
 /**
- * Pages through `archived=only` until every archived row is loaded.
+ * Pages through `archived=only` on demand.
  *
  * The offset advances by the page size only — never by the number of rows
  * received. The list endpoints deliberately back-fill pinned conversations
@@ -35,15 +41,24 @@ const ARCHIVED_FETCH_PAGE_SIZE = 500
  * a page with no new archived row stops it too: a row archived or reordered
  * mid-load can leave the distinct count short for good.
  */
-export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
-  const sessions: SessionInfo[] = []
+// Both the demand-driven settings view and full-history callers use this one
+// cursor/deduplication owner. Yield only new rows so later pages cannot restore
+// a row the user has already removed from the view.
+export async function* iterateArchivedSessions(): AsyncGenerator<ArchivedSessionPage> {
+  const scope = archiveScopeKey()
   const seen = new Set<string>()
   let archivedCount = 0
 
   let offset = 0
 
-  while (true) {
+  while (archiveScopeKey() === scope) {
     const page = await listAllProfileSessions(ARCHIVED_FETCH_PAGE_SIZE, 0, 'only', 'recent', 'all', {}, offset)
+
+    if (archiveScopeKey() !== scope) {
+      return
+    }
+
+    const sessions: SessionInfo[] = []
     const archivedBefore = archivedCount
 
     for (const session of page.sessions) {
@@ -61,14 +76,28 @@ export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
 
     offset += ARCHIVED_FETCH_PAGE_SIZE
 
-    if (
+    const hasMore = !(
       page.sessions.length === 0 ||
       archivedCount >= page.total ||
       (offset >= page.total && archivedCount === archivedBefore)
-    ) {
-      return sessions
+    )
+
+    yield { sessions, hasMore, errors: page.errors }
+
+    if (!hasMore) {
+      return
     }
   }
+}
+
+export async function listEveryArchivedSession(): Promise<SessionInfo[]> {
+  const sessions: SessionInfo[] = []
+
+  for await (const page of iterateArchivedSessions()) {
+    sessions.push(...page.sessions)
+  }
+
+  return sessions
 }
 
 export const $archivedSessions = atom<SessionInfo[]>([])
